@@ -97,8 +97,7 @@ let readySampleId, readySlice;
     });
     eq(`推进步骤 ${step}`, r.status, 200);
   }
-  r = await api(`/api/samples/${readySampleId}/deliver`, { method: "POST", body: "{}" });
-  eq("标记交付", r.status, 200);
+  // 交付动作在第 7 节（报告导出前）进行，以便第 6 节在此样本上新增切片
 }
 
 // ---------- 3. 筛选 ----------
@@ -114,8 +113,8 @@ console.log("3) 批次筛选");
   r = await api("/api/batches?owner=" + encodeURIComponent("高媛"));
   ok("按负责人筛选", r.body.length === 1 && r.body[0].id === "B-FUTURE", JSON.stringify(r.body?.map?.(b => b.id)));
 
-  r = await api("/api/batches?status=" + encodeURIComponent("已交付"));
-  ok("按状态筛选=已交付 命中 B-READY", r.body.length === 1 && r.body[0].id === "B-READY", JSON.stringify(r.body?.map?.(b => b.id)));
+  r = await api("/api/batches?status=" + encodeURIComponent("待观察"));
+  ok("按状态筛选=待观察 命中观察完成未交付的 B-READY", Array.isArray(r.body) && r.body.some(b => b.id === "B-READY" && b.status === "待观察"), JSON.stringify(r.body?.map?.(b => [b.id, b.status])));
 
   r = await api("/api/batches?status=" + encodeURIComponent("制片中"));
   ok("按状态筛选=制片中", Array.isArray(r.body) && r.body.every(b => b.status === "制片中"), JSON.stringify(r.body?.map?.(b => [b.id, b.status])));
@@ -225,13 +224,48 @@ console.log("7) 报告导出：正常导出 Markdown");
   });
   eq("补写观察记录", r.status, 200);
 
+  // 已交付样本不能新增切片（此时尚未交付，先验证未交付可加，交付后拒绝在下面断言）
+  r = await api(`/api/samples/${readySampleId}/slices`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: "SL-R-3", method: "光片" })
+  });
+  eq("未交付样本可继续新增切片 201", r.status, 201);
+  // 立刻删除该切片对状态的影响：推进完成观察
+  for (const step of ["切割", "研磨", "染色", "观察"]) {
+    r = await api(`/api/samples/${readySampleId}/slices/SL-R-3/logs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step, note: step === "观察" ? "第三片观察完成" : "步骤完成" })
+    });
+    eq(`SL-R-3 推进至 ${step}`, r.status, 200);
+  }
+
+  // 全部观察完成后交付
+  r = await api(`/api/samples/${readySampleId}/deliver`, { method: "POST", body: "{}" });
+  eq("全部观察完成后交付 200", r.status, 200);
+  eq("交付状态=已交付", r.body.delivery, "已交付");
+  const repeat = await api(`/api/samples/${readySampleId}/deliver`, { method: "POST", body: "{}" });
+  eq("重复交付幂等 200", repeat.status, 200);
+  eq("重复交付仍为已交付", repeat.body.delivery, "已交付");
+  r = await api("/api/batches?status=" + encodeURIComponent("已交付"));
+  ok("已交付筛选命中 B-READY", r.body.some(b => b.id === "B-READY"), JSON.stringify(r.body?.map?.(b => b.id)));
+
+  // 已交付后新增切片被拒绝
+  r = await api(`/api/samples/${readySampleId}/slices`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: "SL-R-AFTER", method: "光片" })
+  });
+  eq("已交付样本新增切片 → 409", r.status, 409);
+  ok("错误码 sample_delivered", r.body.error === "sample_delivered", r.body.error);
+  const still = (await api("/api/samples")).body.find(s => s.id === readySampleId);
+  eq("拒绝后切片数不变（仍为 3 片）", still.slices.length, 3);
+
   r = await api("/api/batches/B-READY/report");
   eq("全部观察完成 → 200", r.status, 200);
   ok("Content-Type 为 markdown", /text\/markdown/.test(r.contentType), r.contentType);
   ok("含附件文件名", /filename/.test((await fetch(BASE + "/api/batches/B-READY/report")).headers.get("content-disposition") || ""));
   ok("报告含批次标题", /^# 批次交付报告 B-READY/m.test(r.body));
-  ok("报告按批次汇总切片进度", /切片进度：2\/2（100%）/.test(r.body), r.body.slice(0, 300));
-  ok("报告含观察结论", r.body.includes("石英颗粒磨圆度良好") && r.body.includes("细脉状黄铁矿"));
+  ok("报告按批次汇总切片进度", /切片进度：3\/3（100%）/.test(r.body), r.body.slice(0, 300));
+  ok("报告含观察结论", r.body.includes("石英颗粒磨圆度良好") && r.body.includes("细脉状黄铁矿") && r.body.includes("第三片观察完成"));
   ok("报告含负责人与状态", r.body.includes("许舟") && r.body.includes("已交付"));
 }
 
@@ -366,6 +400,87 @@ console.log("7c) 切片步骤顺序流转");
   eq("回退被拒后观察结论保留", state.observation, "完整流程后的观察结论");
 }
 
+// ---------- 7d. 交付校验：空观察拒绝、完整观察可交付、重复交付幂等 ----------
+console.log("7d) 标记交付前置校验");
+async function advance(sampleId, sliceId, untilStep, note = "") {
+  const order = ["取样", "切割", "研磨", "染色", "观察"];
+  const target = order.indexOf(untilStep);
+  for (let i = 1; i <= target; i++) {
+    await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step: order[i], note: untilStep === "观察" && i === target ? note : "步骤完成" })
+    });
+  }
+}
+{
+  let r = await api("/api/samples", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(createSample({ batchId: "B-DELIVER", project: "北坡铁矿", owner: "何栖", sliceId: "SL-D-1", dueDate: future }))
+  });
+  const deliverSampleId = r.body.id;
+  eq("创建待交付样本 201", r.status, 201);
+
+  // 切片尚在制片早期 → 交付被拒
+  r = await api(`/api/samples/${deliverSampleId}/deliver`, { method: "POST", body: "{}" });
+  eq("未完成观察交付 → 422", r.status, 422);
+  ok("错误码 delivery_blocked", r.body.error === "delivery_blocked", r.body.error);
+  ok("列出未完成切片", Array.isArray(r.body.missing) && r.body.missing[0].sliceId === "SL-D-1", JSON.stringify(r.body.missing));
+
+  const getSample = async () => (await api("/api/samples")).body.find(x => x.id === deliverSampleId);
+  let s = await getSample();
+  eq("被拒后 delivery 仍为未交付", s.delivery, "未交付");
+  eq("被拒后样本状态保持制片中", s.status, "制片中");
+  ok("被拒后批次仍非已交付", (await api("/api/batches?status=" + encodeURIComponent("已交付"))).body.every(b => b.id !== "B-DELIVER"));
+
+  // 推进到观察但记录为空 → 仍拒绝
+  await advance(deliverSampleId, "SL-D-1", "观察", "   ");
+  r = await api(`/api/samples/${deliverSampleId}/deliver`, { method: "POST", body: "{}" });
+  eq("全部到观察但记录为空 → 422", r.status, 422);
+  ok("原因=观察记录为空", r.body.missing[0].reason === "观察记录为空", r.body.missing[0].reason);
+  s = await getSample();
+  eq("被拒后仍为未交付", s.delivery, "未交付");
+  eq("样本状态仍为待观察", s.status, "待观察");
+
+  // 补写第一片观察结论后，再加一片未完成观察 → 缺失项应精确为第二片
+  r = await api(`/api/samples/${deliverSampleId}/slices/SL-D-1/logs`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "观察", note: "第一片观察结论完整" })
+  });
+  eq("同步骤补写观察记录 200", r.status, 200);
+  r = await api(`/api/samples/${deliverSampleId}/slices`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: "SL-D-2", method: "光片" })
+  });
+  eq("新增第二片 201", r.status, 201);
+  r = await api(`/api/samples/${deliverSampleId}/deliver`, { method: "POST", body: "{}" });
+  eq("存在未完成观察的第二片 → 422", r.status, 422);
+  ok("缺失项精确为 SL-D-2", r.body.missing.length === 1 && r.body.missing[0].sliceId === "SL-D-2", JSON.stringify(r.body.missing));
+  s = await getSample();
+  eq("被拒后第一片观察结论不受影响", s.slices.find(x => x.id === "SL-D-1").observation, "第一片观察结论完整");
+  eq("被拒后仍为未交付", s.delivery, "未交付");
+
+  // 补完第二片观察 → 交付成功
+  await advance(deliverSampleId, "SL-D-2", "观察", "第二片观察结论完整");
+  r = await api(`/api/samples/${deliverSampleId}/deliver`, { method: "POST", body: "{}" });
+  eq("全部观察完成 → 交付 200", r.status, 200);
+  eq("delivery=已交付", r.body.delivery, "已交付");
+  eq("样本状态=已交付", r.body.status, "已交付");
+
+  // 重复交付幂等
+  r = await api(`/api/samples/${deliverSampleId}/deliver`, { method: "POST", body: "{}" });
+  eq("重复交付 → 200", r.status, 200);
+  eq("重复交付仍为已交付", r.body.delivery, "已交付");
+
+  // 交付与报告闸门一致：交付成功后报告可导出
+  r = await api("/api/batches/B-DELIVER/report");
+  eq("已交付批次报告可导出 200", r.status, 200);
+  ok("报告含两片观察结论", r.body.includes("第一片观察结论完整") && r.body.includes("第二片观察结论完整"));
+
+  // 不存在样本交付 → 404
+  r = await api("/api/samples/CORE-NOPE/deliver", { method: "POST", body: "{}" });
+  eq("交付不存在样本 → 404", r.status, 404);
+}
+
 // ---------- 8. 非法写操作 ----------
 console.log("8) 写操作校验");
 {
@@ -406,11 +521,13 @@ await startServer();
   const r = await api("/api/batches");
   eq("重启后仍可检索", r.status, 200);
   const ids = r.body.map(b => b.id).sort();
-  ok("四个批次均保留", ids.length === 4 && ["B-2026-001", "B-EMPTY-OBS", "B-FUTURE", "B-READY"].every(x => ids.includes(x)), JSON.stringify(ids));
+  ok("五个批次均保留", ids.length === 5 && ["B-2026-001", "B-DELIVER", "B-EMPTY-OBS", "B-FUTURE", "B-READY"].every(x => ids.includes(x)), JSON.stringify(ids));
   const emptyObs = r.body.find(b => b.id === "B-EMPTY-OBS");
   ok("空观察批次重启后状态仍为待观察", emptyObs && emptyObs.status === "待观察", emptyObs && emptyObs.status);
+  const delivered = r.body.find(b => b.id === "B-DELIVER");
+  ok("交付批次重启后仍为已交付", delivered && delivered.status === "已交付", delivered && delivered.status);
   const ready = r.body.find(b => b.id === "B-READY");
-  ok("观察进度保留 2/2", ready.observedSlices === 2 && ready.totalSlices === 2, JSON.stringify([ready.observedSlices, ready.totalSlices]));
+  ok("观察进度保留 3/3", ready.observedSlices === 3 && ready.totalSlices === 3, JSON.stringify([ready.observedSlices, ready.totalSlices]));
   ok("已交付状态保留", ready.status === "已交付", ready.status);
   const seed = r.body.find(b => b.id === "B-2026-001");
   ok("种子批次逾期保留", seed.overdueCount === 1, JSON.stringify(seed.overdueCount));

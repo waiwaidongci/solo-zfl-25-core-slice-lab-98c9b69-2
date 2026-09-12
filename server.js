@@ -238,21 +238,25 @@ function queryBatches(db, params) {
   return { error: 0, body: batches };
 }
 
+// 样本未完成观察的切片清单（交付前校验用，规则与报告导出一致）
+function incompleteSlicesOf(sample) {
+  return sample.slices
+    .filter(slice => !observationDone(slice))
+    .map(slice => ({
+      sampleId: sample.id,
+      sliceId: slice.id,
+      owner: sample.owner,
+      currentStep: slice.status,
+      reason: slice.status === "观察" ? "观察记录为空" : `尚未完成观察（当前步骤：${slice.status}）`
+    }));
+}
 // 交付报告缺失项：任一切片未完成观察即拒绝导出
 function missingObservations(batch) {
   const missing = [];
   for (const sample of batch.samples) {
-    for (const slice of sample.slices) {
-      if (!observationDone(slice)) {
-        missing.push({
-          sampleId: sample.id,
-          project: sample.project,
-          sliceId: slice.id,
-          owner: sample.owner,
-          currentStep: slice.status,
-          reason: slice.status === "观察" ? "观察记录为空" : `尚未完成观察（当前步骤：${slice.status}）`
-        });
-      }
+    for (const item of incompleteSlicesOf(sample)) {
+      const s = sample;
+      missing.push({ ...item, project: s.project });
     }
   }
   return missing;
@@ -491,7 +495,12 @@ const page = `<!doctype html>
         }
         await load();
       } catch (err) {
-        showAlert(err.message);
+        let message = err.message;
+        const p = err.payload;
+        if (p && p.error === "delivery_blocked" && Array.isArray(p.missing)) {
+          message += "\\n未完成切片：\\n" + p.missing.map(m => "· " + m.sampleId + " / " + m.sliceId + "（" + m.owner + "）" + m.reason).join("\\n");
+        }
+        showAlert(message);
       }
     });
     form.onsubmit = async event => {
@@ -583,6 +592,9 @@ const server = http.createServer(async (req, res) => {
     if (addSlice && req.method === "POST") {
       const sample = db.samples.find(item => item.id === addSlice[1]);
       if (!sample) return sendJson(res, 404, { error: "sample_not_found", message: "样本不存在" });
+      if (sample.delivery === "已交付") {
+        return sendJson(res, 409, { error: "sample_delivered", message: `样本 ${sample.id} 已交付，不能再新增切片` });
+      }
       const input = await body(req);
       if (!input.id || !String(input.id).trim()) {
         return sendJson(res, 400, { error: "invalid_input", message: "切片编号不能为空" });
@@ -621,6 +633,17 @@ const server = http.createServer(async (req, res) => {
     if (deliverMatch && req.method === "POST") {
       const sample = db.samples.find(item => item.id === deliverMatch[1]);
       if (!sample) return sendJson(res, 404, { error: "sample_not_found", message: "样本不存在" });
+      // 重复交付按幂等处理，直接返回当前状态
+      if (sample.delivery === "已交付") return sendJson(res, 200, sample);
+      // 全部切片完成观察后才可交付；否则拒绝，状态保持不变
+      const incomplete = incompleteSlicesOf(sample);
+      if (incomplete.length) {
+        return sendJson(res, 422, {
+          error: "delivery_blocked",
+          message: `样本 ${sample.id} 有 ${incomplete.length} 个切片尚未完成观察，无法交付`,
+          missing: incomplete
+        });
+      }
       sample.delivery = "已交付";
       updateSampleStatus(sample);
       await saveDb(db);

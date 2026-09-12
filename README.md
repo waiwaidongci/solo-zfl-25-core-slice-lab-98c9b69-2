@@ -14,6 +14,7 @@ npm start
 
 - 样本创建、切片任务、制片步骤（取样→切割→研磨→染色→观察）记录与交付标记
   - 步骤必须按顺序推进：跳步或回退返回 `400`（`invalid_step_transition`），切片状态与日志保持不变；停留在当前步骤补记备注允许
+  - **全部切片完成观察后才可交付**：未完成观察时交付返回 `422`（`delivery_blocked`）并列出缺失项，状态不变；重复交付幂等返回 `200`；已交付样本不能再新增切片（`409 sample_delivered`）
 - **批次检索**：`GET /api/batches`，支持按项目（模糊）、负责人、状态、建批日期范围筛选
   - 非法筛选条件返回 `400`（`invalid_status` / `invalid_date` / `invalid_range` / `invalid_filter`）
   - 无匹配结果返回 `404`（`no_results`）
