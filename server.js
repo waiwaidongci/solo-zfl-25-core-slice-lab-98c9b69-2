@@ -80,6 +80,17 @@ function nextStepOf(slice) {
   const idx = taskSteps.indexOf(slice.status);
   return taskSteps[Math.min(idx + 1, taskSteps.length - 1)];
 }
+// 步骤流转：仅允许停留在当前步骤（补记备注）或推进到紧邻的下一步；跳步、回退均非法
+function checkStepTransition(slice, target) {
+  const fromIdx = taskSteps.indexOf(slice.status);
+  const toIdx = taskSteps.indexOf(target);
+  if (toIdx === fromIdx) return { ok: true, advance: false };
+  if (toIdx === fromIdx + 1) return { ok: true, advance: true };
+  const reason = toIdx < fromIdx
+    ? `步骤不可回退：当前为「${slice.status}」，不能改回「${target}」`
+    : `步骤不可跳步：需按 ${taskSteps.join("→")} 顺序推进，当前为「${slice.status}」，下一步应为「${taskSteps[fromIdx + 1]}」`;
+  return { ok: false, reason };
+}
 function todayStr() { return new Date().toISOString().slice(0, 10); }
 function isValidDateStr(v) {
   if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
@@ -593,6 +604,11 @@ const server = http.createServer(async (req, res) => {
       const input = await body(req);
       if (!taskSteps.includes(input.step)) {
         return sendJson(res, 400, { error: "invalid_step", message: `步骤非法：${input.step}，可选值为 ${taskSteps.join("、")}` });
+      }
+      // 校验顺序流转；非法时直接返回，切片状态与日志均保持不变
+      const transition = checkStepTransition(slice, input.step);
+      if (!transition.ok) {
+        return sendJson(res, 400, { error: "invalid_step_transition", message: transition.reason });
       }
       slice.status = input.step;
       if (input.step === "观察") slice.observation = (input.note || "").trim() || slice.observation;

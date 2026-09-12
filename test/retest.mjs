@@ -200,12 +200,14 @@ console.log("6) 报告导出：缺失切片拒绝");
   eq("有一个新切片未观察 → 422", r.status, 422);
   ok("缺失项精确指向 SL-R-2", r.body.missing.length === 1 && r.body.missing[0].sliceId === "SL-R-2", JSON.stringify(r.body.missing));
 
-  // 已到观察步骤但观察记录为空，同样拒绝
-  r = await api(`/api/samples/${readySampleId}/slices/SL-R-2/logs`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ step: "观察", note: "" })
-  });
-  eq("记录观察步骤", r.status, 200);
+  // 已到观察步骤但观察记录为空，同样拒绝：需按顺序推进到观察
+  for (const step of ["切割", "研磨", "染色", "观察"]) {
+    r = await api(`/api/samples/${readySampleId}/slices/SL-R-2/logs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step, note: "" })
+    });
+    eq(`SL-R-2 顺序推进至 ${step}`, r.status, 200);
+  }
   r = await api("/api/batches/B-READY/report");
   eq("观察记录为空仍 422", r.status, 422);
   ok("原因=观察记录为空", r.body.missing[0].reason === "观察记录为空", r.body.missing[0].reason);
@@ -275,6 +277,93 @@ console.log("7b) 空观察记录的批次状态");
   r = await api("/api/batches/B-EMPTY-OBS/report");
   eq("观察记录为空仍拒绝导出 422", r.status, 422);
   ok("两片均列为缺失项", r.body.missing.length === 2 && r.body.missing.every(m => m.reason === "观察记录为空"), JSON.stringify(r.body.missing));
+}
+
+// ---------- 7c. 步骤流转：正常顺序、跳步、回退 ----------
+console.log("7c) 切片步骤顺序流转");
+{
+  const batches = await api("/api/batches");
+  const future = batches.body.find(b => b.id === "B-FUTURE");
+  const sampleId = future.samples[0].id;
+  const sliceId = "SL-F-1";
+  const before = future.samples[0].slices.find(s => s.id === sliceId);
+  eq("测试切片初始步骤=取样", before.status, "取样");
+  const logsBeforeCount = before.logs.length;
+
+  let r = await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "观察", note: "想直接观察" })
+  });
+  eq("取样→观察（跳步）400", r.status, 400);
+  ok("错误码 invalid_step_transition", r.body.error === "invalid_step_transition", r.body.error);
+  ok("提示需按顺序推进", /顺序/.test(r.body.message), r.body.message);
+
+  for (const bad of ["研磨", "染色"]) {
+    r = await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step: bad, note: "跳步" })
+    });
+    eq(`取样→${bad}（跳步）400`, r.status, 400);
+  }
+
+  let state = (await api("/api/batches")).body.find(b => b.id === "B-FUTURE").samples[0].slices.find(s => s.id === sliceId);
+  eq("跳步被拒后状态仍是取样", state.status, "取样");
+  eq("跳步被拒后日志条数不变", state.logs.length, logsBeforeCount);
+  ok("跳步被拒后观察记录未写入", (state.observation || "") === "");
+
+  r = await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "切割", note: "正常推进切割" })
+  });
+  eq("取样→切割（合法）200", r.status, 200);
+  eq("切片状态推进为切割", r.body.slices.find(s => s.id === sliceId).status, "切割");
+
+  r = await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "取样", note: "想回退" })
+  });
+  eq("切割→取样（回退）400", r.status, 400);
+  ok("回退错误码 invalid_step_transition", r.body.error === "invalid_step_transition", r.body.error);
+  ok("回退提示不可回退", /不可回退/.test(r.body.message), r.body.message);
+
+  r = await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "观察", note: "再跳一步" })
+  });
+  eq("切割→观察（跳步）400", r.status, 400);
+
+  state = (await api("/api/batches")).body.find(b => b.id === "B-FUTURE").samples[0].slices.find(s => s.id === sliceId);
+  eq("非法流转后状态仍停留在切割", state.status, "切割");
+  eq("非法流转未追加日志", state.logs.length, logsBeforeCount + 1);
+
+  // 当前步骤补记备注：允许，不视为回退
+  r = await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "切割", note: "补充切割参数" })
+  });
+  eq("切割→切割（同步骤补记）200", r.status, 200);
+  eq("补记后状态仍为切割", r.body.slices.find(s => s.id === sliceId).status, "切割");
+
+  // 合法走完后续流程
+  for (const step of ["研磨", "染色", "观察"]) {
+    r = await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step, note: step === "观察" ? "完整流程后的观察结论" : "步骤完成" })
+    });
+    eq(`合法顺序推进至 ${step} 200`, r.status, 200);
+  }
+  state = (await api("/api/batches")).body.find(b => b.id === "B-FUTURE").samples[0].slices.find(s => s.id === sliceId);
+  eq("走完流程状态为观察", state.status, "观察");
+  ok("观察记录已保存", state.observation === "完整流程后的观察结论");
+
+  // 到达观察后再回退仍被拒绝
+  r = await api(`/api/samples/${sampleId}/slices/${sliceId}/logs`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "研磨", note: "观察后想退回" })
+  });
+  eq("观察→研磨（回退）400", r.status, 400);
+  state = (await api("/api/batches")).body.find(b => b.id === "B-FUTURE").samples[0].slices.find(s => s.id === sliceId);
+  eq("回退被拒后观察结论保留", state.observation, "完整流程后的观察结论");
 }
 
 // ---------- 8. 非法写操作 ----------
