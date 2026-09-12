@@ -82,7 +82,11 @@ function nextStepOf(slice) {
 }
 function todayStr() { return new Date().toISOString().slice(0, 10); }
 function isValidDateStr(v) {
-  return typeof v === "string" && /^\d{4}-\d{2}-\d{2}$/.test(v) && !Number.isNaN(Date.parse(`${v}T00:00:00`));
+  if (typeof v !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+  const [, y, m, d] = v.match(/^(\d{4})-(\d{2})-(\d{2})$/).map(Number);
+  // 回读构造日期的年月日分量，排除 02-30、04-31 这类被 Date 自动进位的不存在日期
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  return dt.getUTCFullYear() === y && dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d;
 }
 // 批次计划完成日 = 组内最早的样本截止日；为空则视为无期限
 function batchDueDate(samples) {
@@ -126,11 +130,13 @@ function buildBatch(batchId, samples) {
     }
   }
   const delivered = samples.every(s => s.delivery === "已交付");
-  const allObserved = totalSlices > 0 && observedSlices === totalSlices;
+  // 状态聚合规则与样本（updateSampleStatus）保持一致：只看切片所处步骤，
+  // 切片全部走到“观察”即视为待观察，即使观察记录尚未填写
+  const sliceSteps = samples.flatMap(s => s.slices.map(c => c.status));
   let status;
   if (delivered) status = "已交付";
-  else if (allObserved) status = "待观察";
-  else if (samples.some(s => s.status === "制片中")) status = "制片中";
+  else if (sliceSteps.length && sliceSteps.every(step => step === "观察")) status = "待观察";
+  else if (sliceSteps.some(step => ["取样", "切割", "研磨", "染色"].includes(step))) status = "制片中";
   else status = "待切割";
 
   // 下一步负责人：优先逾期项，其次取下一步流程最靠前的待办
@@ -201,10 +207,10 @@ function queryBatches(db, params) {
     return { error: 400, body: { error: "invalid_status", message: `状态非法：${status}，可选值为 ${statuses.join("、")}` } };
   }
   if ((from !== undefined && from !== "") && !isValidDateStr(from)) {
-    return { error: 400, body: { error: "invalid_date", message: `起始日期格式非法：${from}，应为 YYYY-MM-DD` } };
+    return { error: 400, body: { error: "invalid_date", message: `起始日期非法：${from}，请使用真实存在的年月日（YYYY-MM-DD）` } };
   }
   if ((to !== undefined && to !== "") && !isValidDateStr(to)) {
-    return { error: 400, body: { error: "invalid_date", message: `截止日期格式非法：${to}，应为 YYYY-MM-DD` } };
+    return { error: 400, body: { error: "invalid_date", message: `截止日期非法：${to}，请使用真实存在的年月日（YYYY-MM-DD）` } };
   }
   if (from && to && from > to) {
     return { error: 400, body: { error: "invalid_range", message: `日期范围非法：起始日期 ${from} 晚于截止日期 ${to}` } };

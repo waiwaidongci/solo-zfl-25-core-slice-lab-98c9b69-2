@@ -139,6 +139,24 @@ console.log("4) 非法筛选条件 → 400");
   r = await api("/api/batches?from=" + encodeURIComponent("09/01/2026"));
   eq("非 YYYY-MM-DD 日期 400", r.status, 400);
 
+  for (const bad of ["2026-02-30", "2026-02-29", "2026-04-31", "2026-06-31", "2026-00-10", "2026-07-00"]) {
+    r = await api("/api/batches?from=" + bad);
+    eq(`不存在的日期 ${bad} → 400`, r.status, 400, `实际 ${r.status}`);
+    ok(`${bad} 错误码 invalid_date 且说明原因`, r.body.error === "invalid_date" && /真实存在|不存在|非法/.test(r.body.message || ""), JSON.stringify(r.body));
+  }
+  // 正常/真实日期通过校验（无数据时返回 404 no_results，而非 400；有数据 200）
+  for (const good of ["2024-02-29", "2026-02-28", "2026-12-31", "2000-02-29", today]) {
+    r = await api(`/api/batches?from=${good}&to=${good}`);
+    ok(`真实日期 ${good} 不被判非法（status != 400）`, r.status !== 400, `实际 ${r.status} ${JSON.stringify(r.body)}`);
+  }
+  {
+    // 2023 非闰年：02-29 不存在；2024 闰年：02-29 存在
+    const nonLeap = await api("/api/batches?from=2023-02-29");
+    eq("非闰年 2023-02-29 → 400", nonLeap.status, 400);
+    const leap = await api("/api/batches?from=2024-02-29&to=2024-02-29");
+    ok("闰年 2024-02-29 通过校验（404 无结果而非 400）", leap.status === 404 && leap.body.error === "no_results", `实际 ${leap.status}`);
+  }
+
   r = await api(`/api/batches?from=${future}&to=${past}`);
   eq("起止倒置 400", r.status, 400);
   ok("错误码 invalid_range", r.body.error === "invalid_range", r.body.error);
@@ -215,6 +233,50 @@ console.log("7) 报告导出：正常导出 Markdown");
   ok("报告含负责人与状态", r.body.includes("许舟") && r.body.includes("已交付"));
 }
 
+// ---------- 7b. 全部到观察但记录为空 → 批次状态仍为待观察 ----------
+console.log("7b) 空观察记录的批次状态");
+{
+  let r = await api("/api/samples", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(createSample({ batchId: "B-EMPTY-OBS", project: "西沟铀矿", owner: "沈默", sliceId: "SL-E-1", dueDate: future }))
+  });
+  const emptySampleId = r.body.id;
+  eq("创建空观察批次样本 201", r.status, 201);
+
+  // 切片只推进到“观察”，但不填写观察记录
+  for (const step of ["取样", "切割", "研磨", "染色", "观察"]) {
+    r = await api(`/api/samples/${emptySampleId}/slices/SL-E-1/logs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step, note: "" })
+    });
+    eq(`空备注推进步骤 ${step}`, r.status, 200);
+  }
+  eq("样本状态=待观察", r.body.status, "待观察");
+
+  // 再加一片同样到观察但记录为空
+  r = await api(`/api/samples/${emptySampleId}/slices`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id: "SL-E-2", method: "光片" })
+  });
+  for (const step of ["切割", "研磨", "染色", "观察"]) {
+    await api(`/api/samples/${emptySampleId}/slices/SL-E-2/logs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step, note: "  " })
+    });
+  }
+
+  r = await api("/api/batches?status=" + encodeURIComponent("待观察"));
+  const target = r.body.find(b => b.id === "B-EMPTY-OBS");
+  ok("批次可在“待观察”筛选中命中", !!target, JSON.stringify(r.body?.map?.(b => [b.id, b.status])));
+  eq("全部切片到观察但记录为空：批次状态=待观察（非待切割）", target && target.status, "待观察");
+  eq("观察完成进度仍为 0/2", target && target.observedSlices, 0);
+  eq("总切片数 2", target && target.totalSlices, 2);
+
+  r = await api("/api/batches/B-EMPTY-OBS/report");
+  eq("观察记录为空仍拒绝导出 422", r.status, 422);
+  ok("两片均列为缺失项", r.body.missing.length === 2 && r.body.missing.every(m => m.reason === "观察记录为空"), JSON.stringify(r.body.missing));
+}
+
 // ---------- 8. 非法写操作 ----------
 console.log("8) 写操作校验");
 {
@@ -255,7 +317,9 @@ await startServer();
   const r = await api("/api/batches");
   eq("重启后仍可检索", r.status, 200);
   const ids = r.body.map(b => b.id).sort();
-  ok("三个批次均保留", ids.length === 3 && ["B-2026-001", "B-FUTURE", "B-READY"].every(x => ids.includes(x)), JSON.stringify(ids));
+  ok("四个批次均保留", ids.length === 4 && ["B-2026-001", "B-EMPTY-OBS", "B-FUTURE", "B-READY"].every(x => ids.includes(x)), JSON.stringify(ids));
+  const emptyObs = r.body.find(b => b.id === "B-EMPTY-OBS");
+  ok("空观察批次重启后状态仍为待观察", emptyObs && emptyObs.status === "待观察", emptyObs && emptyObs.status);
   const ready = r.body.find(b => b.id === "B-READY");
   ok("观察进度保留 2/2", ready.observedSlices === 2 && ready.totalSlices === 2, JSON.stringify([ready.observedSlices, ready.totalSlices]));
   ok("已交付状态保留", ready.status === "已交付", ready.status);
