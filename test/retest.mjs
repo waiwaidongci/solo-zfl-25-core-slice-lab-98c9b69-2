@@ -481,6 +481,83 @@ async function advance(sampleId, sliceId, untilStep, note = "") {
   eq("交付不存在样本 → 404", r.status, 404);
 }
 
+// ---------- 7e. 并发重复提交 ----------
+console.log("7e) 切片步骤并发重复提交");
+{
+  let r = await api("/api/samples", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(createSample({ batchId: "B-CONCUR", project: "南坡钨矿", owner: "温简", sliceId: "SL-C-1", dueDate: future }))
+  });
+  const concSampleId = r.body.id;
+  eq("创建并发测试样本 201", r.status, 201);
+  const getSlice = async () => (await api("/api/samples")).body.find(s => s.id === concSampleId).slices.find(x => x.id === "SL-C-1");
+
+  const initialLogs = (await getSlice()).logs.length;
+
+  // 两个相同的“切割”推进请求同时发出
+  const payload = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: "切割", note: "并发切割请求" }) };
+  const [a, b] = await Promise.all([
+    api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, payload),
+    api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, payload)
+  ]);
+  const statuses = [a.status, b.status].sort();
+  eq("并发两请求：一次 200 一次 409", JSON.stringify(statuses), JSON.stringify([200, 409]));
+  const rejected = [a, b].find(x => x.status === 409);
+  ok("被拒请求错误码 duplicate_submission", rejected && rejected.body.error === "duplicate_submission", JSON.stringify([a.status, b.status, b.body]));
+  ok("被拒请求有中文提示", rejected && /重复提交/.test(rejected.body.message), rejected && rejected.body.message);
+
+  let slice = await getSlice();
+  eq("状态只推进一次：切割", slice.status, "切割");
+  eq("日志只增加一条", slice.logs.length, initialLogs + 1);
+  eq("最后一条日志为切割", slice.logs[slice.logs.length - 1].step, "切割");
+
+  // 三连并发同样只生效一次
+  const p2 = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: "研磨", note: "三连并发" }) };
+  const three = await Promise.all([
+    api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, p2),
+    api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, p2),
+    api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, p2)
+  ]);
+  eq("三连并发：恰好一次 200", three.filter(x => x.status === 200).length, 1);
+  eq("三连并发：两次 409", three.filter(x => x.status === 409).length, 2);
+  slice = await getSlice();
+  eq("三连并发后状态=研磨", slice.status, "研磨");
+  eq("三连并发后日志仍只再增加一条", slice.logs.length, initialLogs + 2);
+
+  // 重复请求被拦后，顺序的正常推进仍可用
+  for (const step of ["染色", "观察"]) {
+    r = await api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ step, note: step === "观察" ? "并发复测后的观察结论" : "顺序推进" })
+    });
+    eq(`并发拦截后顺序推进 ${step} 仍 200`, r.status, 200);
+  }
+  slice = await getSlice();
+  eq("最终状态=观察", slice.status, "观察");
+  ok("观察结论保存", slice.observation === "并发复测后的观察结论");
+
+  // 同步骤但备注不同：属于正常补记，不应被误判为重复
+  const logsBefore = slice.logs.length;
+  r = await api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step: "观察", note: "补充一条不同的观察备注" })
+  });
+  eq("同步骤不同备注补记 200", r.status, 200);
+  slice = await getSlice();
+  eq("补记日志增加一条", slice.logs.length, logsBefore + 1);
+
+  // 并发跳步请求：两个都不得推进、不得写日志
+  const p3 = { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ step: "取样", note: "并发回退" }) };
+  const rb = await Promise.all([
+    api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, p3),
+    api(`/api/samples/${concSampleId}/slices/SL-C-1/logs`, p3)
+  ]);
+  ok("并发回退两请求都被拒", rb.every(x => x.status === 400), JSON.stringify(rb.map(x => x.status)));
+  slice = await getSlice();
+  eq("并发回退后状态仍为观察", slice.status, "观察");
+  eq("并发回退未追加日志", slice.logs.length, logsBefore + 1);
+}
+
 // ---------- 8. 非法写操作 ----------
 console.log("8) 写操作校验");
 {
@@ -521,7 +598,8 @@ await startServer();
   const r = await api("/api/batches");
   eq("重启后仍可检索", r.status, 200);
   const ids = r.body.map(b => b.id).sort();
-  ok("五个批次均保留", ids.length === 5 && ["B-2026-001", "B-DELIVER", "B-EMPTY-OBS", "B-FUTURE", "B-READY"].every(x => ids.includes(x)), JSON.stringify(ids));
+  const expectedBatches = ["B-2026-001", "B-CONCUR", "B-DELIVER", "B-EMPTY-OBS", "B-FUTURE", "B-READY"];
+  ok("六个批次均保留", ids.length === expectedBatches.length && expectedBatches.every(x => ids.includes(x)), JSON.stringify(ids));
   const emptyObs = r.body.find(b => b.id === "B-EMPTY-OBS");
   ok("空观察批次重启后状态仍为待观察", emptyObs && emptyObs.status === "待观察", emptyObs && emptyObs.status);
   const delivered = r.body.find(b => b.id === "B-DELIVER");

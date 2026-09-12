@@ -60,6 +60,23 @@ async function loadDb() {
   return db;
 }
 async function saveDb(db) { await writeFile(dbPath, JSON.stringify(db, null, 2)); }
+// 写锁：所有“读文件→改→写文件”操作串行执行，回调内拿到的是刚从磁盘加载的最新数据，
+// 杜绝并发请求读到同一快照导致的重复推进/丢失更新
+let writeChain = Promise.resolve();
+function withWriteLock(fn) {
+  const run = writeChain.then(() => loadDb().then(fn));
+  // 无论本次成功与否都释放锁
+  writeChain = run.then(() => {}, () => {});
+  return run;
+}
+// 并发重复提交：同一切片在窗口内已记录过步骤与备注完全相同的日志，即视为重复请求
+const DUPLICATE_WINDOW_MS = 30_000;
+function duplicateLog(slice, step, note) {
+  const last = slice.logs[slice.logs.length - 1];
+  if (!last || last.step !== step || (last.note || "") !== (note || "")) return false;
+  const at = Date.parse(last.at);
+  return Number.isFinite(at) && Date.now() - at <= DUPLICATE_WINDOW_MS;
+}
 async function body(req) {
   const chunks = [];
   for await (const chunk of req) chunks.push(chunk);
@@ -536,11 +553,18 @@ function validateSampleInput(input) {
 const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
-    const db = await loadDb();
     if (req.method === "GET" && url.pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
       return res.end(page);
     }
+    // 写请求：先读取请求体，再进入写锁串行执行（锁内重新加载磁盘最新数据）
+    if (req.method === "POST" && (url.pathname === "/api/samples"
+      || /^\/api\/samples\/[^/]+\/(slices|deliver)$/.test(url.pathname)
+      || /^\/api\/samples\/[^/]+\/slices\/[^/]+\/logs$/.test(url.pathname))) {
+      const input = await body(req);
+      return await withWriteLock(db => handleWrite(res, url, db, input));
+    }
+    const db = await loadDb();
     // 批次检索
     if (req.method === "GET" && url.pathname === "/api/batches") {
       const result = queryBatches(db, Object.fromEntries(url.searchParams.entries()));
@@ -567,92 +591,103 @@ const server = http.createServer(async (req, res) => {
       return res.end(report);
     }
     if (req.method === "GET" && url.pathname === "/api/samples") return sendJson(res, 200, db.samples);
-    if (req.method === "POST" && url.pathname === "/api/samples") {
-      const input = await body(req);
-      const invalid = validateSampleInput(input);
-      if (invalid) return sendJson(res, invalid.error, invalid.body);
-      if (db.samples.some(s => s.slices.some(c => c.id === input.sliceId))) {
-        return sendJson(res, 409, { error: "duplicate_slice", message: `切片编号已存在：${input.sliceId}` });
-      }
-      const sample = {
-        id: `CORE-${Date.now()}`,
-        batchId: input.batchId.trim(),
-        project: input.project, borehole: input.borehole, coreBox: input.coreBox,
-        depth: input.depth, owner: input.owner,
-        status: "待切割", delivery: "未交付",
-        createdAt: new Date().toISOString(), dueDate: input.dueDate,
-        slices: [{ id: input.sliceId, method: input.method, observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "创建初始切片任务" }] }]
-      };
-      updateSampleStatus(sample);
-      db.samples.unshift(sample);
-      await saveDb(db);
-      return sendJson(res, 201, sample);
-    }
-    const addSlice = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices$/);
-    if (addSlice && req.method === "POST") {
-      const sample = db.samples.find(item => item.id === addSlice[1]);
-      if (!sample) return sendJson(res, 404, { error: "sample_not_found", message: "样本不存在" });
-      if (sample.delivery === "已交付") {
-        return sendJson(res, 409, { error: "sample_delivered", message: `样本 ${sample.id} 已交付，不能再新增切片` });
-      }
-      const input = await body(req);
-      if (!input.id || !String(input.id).trim()) {
-        return sendJson(res, 400, { error: "invalid_input", message: "切片编号不能为空" });
-      }
-      if (db.samples.some(s => s.slices.some(c => c.id === input.id))) {
-        return sendJson(res, 409, { error: "duplicate_slice", message: `切片编号已存在：${input.id}` });
-      }
-      sample.slices.push({ id: input.id, method: input.method || "未指定", observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "新增切片任务" }] });
-      updateSampleStatus(sample);
-      await saveDb(db);
-      return sendJson(res, 201, sample);
-    }
-    const logMatch = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices\/([^/]+)\/logs$/);
-    if (logMatch && req.method === "POST") {
-      const sample = db.samples.find(item => item.id === logMatch[1]);
-      if (!sample) return sendJson(res, 404, { error: "sample_not_found", message: "样本不存在" });
-      const slice = sample.slices.find(item => item.id === logMatch[2]);
-      if (!slice) return sendJson(res, 404, { error: "slice_not_found", message: "切片不存在" });
-      const input = await body(req);
-      if (!taskSteps.includes(input.step)) {
-        return sendJson(res, 400, { error: "invalid_step", message: `步骤非法：${input.step}，可选值为 ${taskSteps.join("、")}` });
-      }
-      // 校验顺序流转；非法时直接返回，切片状态与日志均保持不变
-      const transition = checkStepTransition(slice, input.step);
-      if (!transition.ok) {
-        return sendJson(res, 400, { error: "invalid_step_transition", message: transition.reason });
-      }
-      slice.status = input.step;
-      if (input.step === "观察") slice.observation = (input.note || "").trim() || slice.observation;
-      slice.logs.push({ at: new Date().toISOString(), step: input.step, note: input.note || "" });
-      updateSampleStatus(sample);
-      await saveDb(db);
-      return sendJson(res, 200, sample);
-    }
-    const deliverMatch = url.pathname.match(/^\/api\/samples\/([^/]+)\/deliver$/);
-    if (deliverMatch && req.method === "POST") {
-      const sample = db.samples.find(item => item.id === deliverMatch[1]);
-      if (!sample) return sendJson(res, 404, { error: "sample_not_found", message: "样本不存在" });
-      // 重复交付按幂等处理，直接返回当前状态
-      if (sample.delivery === "已交付") return sendJson(res, 200, sample);
-      // 全部切片完成观察后才可交付；否则拒绝，状态保持不变
-      const incomplete = incompleteSlicesOf(sample);
-      if (incomplete.length) {
-        return sendJson(res, 422, {
-          error: "delivery_blocked",
-          message: `样本 ${sample.id} 有 ${incomplete.length} 个切片尚未完成观察，无法交付`,
-          missing: incomplete
-        });
-      }
-      sample.delivery = "已交付";
-      updateSampleStatus(sample);
-      await saveDb(db);
-      return sendJson(res, 200, sample);
-    }
     sendJson(res, 404, { error: "not_found", message: "接口不存在" });
   } catch (error) {
     sendJson(res, 500, { error: "server_error", message: error.message });
   }
 });
+
+// 所有写操作在此串行执行；db 为持锁后从磁盘加载的最新快照
+async function handleWrite(res, url, db, input) {
+  if (url.pathname === "/api/samples") {
+    const invalid = validateSampleInput(input);
+    if (invalid) return sendJson(res, invalid.error, invalid.body);
+    if (db.samples.some(s => s.slices.some(c => c.id === input.sliceId))) {
+      return sendJson(res, 409, { error: "duplicate_slice", message: `切片编号已存在：${input.sliceId}` });
+    }
+    const sample = {
+      id: `CORE-${Date.now()}`,
+      batchId: input.batchId.trim(),
+      project: input.project, borehole: input.borehole, coreBox: input.coreBox,
+      depth: input.depth, owner: input.owner,
+      status: "待切割", delivery: "未交付",
+      createdAt: new Date().toISOString(), dueDate: input.dueDate,
+      slices: [{ id: input.sliceId, method: input.method, observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "创建初始切片任务" }] }]
+    };
+    updateSampleStatus(sample);
+    db.samples.unshift(sample);
+    await saveDb(db);
+    return sendJson(res, 201, sample);
+  }
+  const addSlice = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices$/);
+  if (addSlice) {
+    const sample = db.samples.find(item => item.id === addSlice[1]);
+    if (!sample) return sendJson(res, 404, { error: "sample_not_found", message: "样本不存在" });
+    if (sample.delivery === "已交付") {
+      return sendJson(res, 409, { error: "sample_delivered", message: `样本 ${sample.id} 已交付，不能再新增切片` });
+    }
+    if (!input.id || !String(input.id).trim()) {
+      return sendJson(res, 400, { error: "invalid_input", message: "切片编号不能为空" });
+    }
+    if (db.samples.some(s => s.slices.some(c => c.id === input.id))) {
+      return sendJson(res, 409, { error: "duplicate_slice", message: `切片编号已存在：${input.id}` });
+    }
+    sample.slices.push({ id: input.id, method: input.method || "未指定", observation: "", status: "取样", logs: [{ at: new Date().toISOString(), step: "取样", note: "新增切片任务" }] });
+    updateSampleStatus(sample);
+    await saveDb(db);
+    return sendJson(res, 201, sample);
+  }
+  const logMatch = url.pathname.match(/^\/api\/samples\/([^/]+)\/slices\/([^/]+)\/logs$/);
+  if (logMatch) {
+    const sample = db.samples.find(item => item.id === logMatch[1]);
+    if (!sample) return sendJson(res, 404, { error: "sample_not_found", message: "样本不存在" });
+    const slice = sample.slices.find(item => item.id === logMatch[2]);
+    if (!slice) return sendJson(res, 404, { error: "slice_not_found", message: "切片不存在" });
+    if (!taskSteps.includes(input.step)) {
+      return sendJson(res, 400, { error: "invalid_step", message: `步骤非法：${input.step}，可选值为 ${taskSteps.join("、")}` });
+    }
+    // 校验顺序流转；非法时直接返回，切片状态与日志均保持不变
+    const transition = checkStepTransition(slice, input.step);
+    if (!transition.ok) {
+      return sendJson(res, 400, { error: "invalid_step_transition", message: transition.reason });
+    }
+    // 并发重复提交拦截：写锁串行化后，后到请求看到的状态已被推进，表现为同一步骤；
+    // 步骤与备注在窗口内与最后一条日志完全相同即判定重复，拒绝且不再产生任何变更
+    const note = input.note || "";
+    if (duplicateLog(slice, input.step, note)) {
+      return sendJson(res, 409, {
+        error: "duplicate_submission",
+        message: `切片 ${slice.id} 的「${input.step}」步骤刚刚已记录，请勿重复提交`
+      });
+    }
+    slice.status = input.step;
+    if (input.step === "观察") slice.observation = note.trim() || slice.observation;
+    slice.logs.push({ at: new Date().toISOString(), step: input.step, note });
+    updateSampleStatus(sample);
+    await saveDb(db);
+    return sendJson(res, 200, sample);
+  }
+  const deliverMatch = url.pathname.match(/^\/api\/samples\/([^/]+)\/deliver$/);
+  if (deliverMatch) {
+    const sample = db.samples.find(item => item.id === deliverMatch[1]);
+    if (!sample) return sendJson(res, 404, { error: "sample_not_found", message: "样本不存在" });
+    // 重复交付按幂等处理，直接返回当前状态
+    if (sample.delivery === "已交付") return sendJson(res, 200, sample);
+    // 全部切片完成观察后才可交付；否则拒绝，状态保持不变
+    const incomplete = incompleteSlicesOf(sample);
+    if (incomplete.length) {
+      return sendJson(res, 422, {
+        error: "delivery_blocked",
+        message: `样本 ${sample.id} 有 ${incomplete.length} 个切片尚未完成观察，无法交付`,
+        missing: incomplete
+      });
+    }
+    sample.delivery = "已交付";
+    updateSampleStatus(sample);
+    await saveDb(db);
+    return sendJson(res, 200, sample);
+  }
+  return sendJson(res, 404, { error: "not_found", message: "接口不存在" });
+}
 
 server.listen(port, () => console.log(`Core slice lab app listening on http://localhost:${port}`));
