@@ -2,6 +2,7 @@
   "samples": [
     {
       "id": "CORE-001",
+      "batchId": "B-2026-001",
       "project": "东岭铜矿薄片",
       "borehole": "ZK-17",
       "coreBox": "BX-09",
@@ -9,6 +10,8 @@
       "owner": "陆川",
       "status": "制片中",
       "delivery": "未交付",
+      "createdAt": "2026-06-12T10:00:00.000Z",
+      "dueDate": "2026-08-31",
       "slices": [
         {
           "id": "SL-001-A",
